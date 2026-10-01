@@ -27,8 +27,12 @@ svg { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-width:
 dialog { background: #1b1b1b; border: 1px solid #333; border-radius: 12px; padding: 0; width: min(22rem, calc(100% - 2rem)); margin: auto }
 dialog::backdrop { background: #000a }
 dialog input { background: #111 }
-#uw, #nu { display: grid; gap: .6rem }
-#uw { padding: 1rem }
+#uw, #nu, #ef { display: grid; gap: .6rem }
+#uw, #ef { padding: 1rem }
+#ef div { display: flex; gap: .5rem }
+#ef div button { flex: 1; border-radius: 8px; padding: .7rem }
+#ef div button:last-child { background: #ddd; color: #111 }
+#edel { border: 1px solid #533; color: #e66 }
 #ul { list-style: none; padding: 0; margin-bottom: .4rem }
 #ul li { display: flex; justify-content: space-between; align-items: center; min-height: 2.5rem; border-bottom: 1px solid #2a2a2a }
 #ul li span { color: #666 }
@@ -40,8 +44,13 @@ header { position: sticky; top: 0; background: #111; padding: .75rem; z-index: 1
 #sug button, #tabs button { flex: none; border: 1px solid #333; border-radius: 99px; padding: .3rem .8rem; margin: .5rem .4rem 0 0 }
 #tabs button { margin: 0 }
 #tabs [aria-current=true] { background: #ddd; color: #111; border-color: #ddd }
-.todo button, .done button { display: block; width: 100%; text-align: left; padding: .75rem 1rem; border-bottom: 1px solid #1e1e1e; content-visibility: auto; contain-intrinsic-size: auto 2.9rem; overflow-wrap: anywhere }
-.done button { color: #555; text-decoration: line-through }
+.t { display: block; width: 100%; text-align: left; padding: .75rem 3rem .75rem 1rem; border-bottom: 1px solid #1e1e1e; overflow-wrap: anywhere;
+  content-visibility: auto; contain-intrinsic-size: auto 2.9rem;
+  /* pencil = background on the row itself: a separate edit element per row made 10k-row scrolling stutter */
+  background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23555' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z'/%3E%3Cpath d='m15 5 4 4'/%3E%3C/svg%3E") right 1rem center / 18px no-repeat }
+.t::after { content: ' ' attr(data-q); color: #888 }
+.done .t { color: #555; text-decoration: line-through }
+.done .t::after { color: #444 }
 .done:not(:empty) { border-top: 1px solid #333 }
 </style>
 <body>
@@ -72,13 +81,20 @@ header { position: sticky; top: 0; background: #111; padding: .75rem; z-index: 1
       <button>Add user</button>
     </form>
   </div></dialog>
+  <dialog id="ed"><form id="ef">
+    <h2>Edit item</h2>
+    <input id="ei" autocomplete="off" maxlength="200" required>
+    <div><button type="button" id="edel">Delete</button><button>Save</button></div>
+  </form></dialog>
 </main>
 <script>
 if (document.body.classList.contains('app')) {
-  const lists = new Map // id -> { tab, todo, done, items: Map(lowercase name -> { el, done, t }) }
-  let cur, rev = 0, tick = 0, pending = 0, queue = Promise.resolve()
+  const lists = new Map // id -> { tab, todo, done, items: Map(lowercase name -> { el, done, qty, n }) }
+  let cur, editing, rev = 0, tick = 0, pending = 0, queue = Promise.resolve()
   try { cur = +localStorage.l } catch {}
   const el = (tag, props) => Object.assign(document.createElement(tag), props)
+  // "eggs x2" -> ["eggs", "x2"]; same regex as server.js
+  const parse = s => { const m = /^(.+?)\s+(?:[x×*]\s*(\d+)|(\d+)\s*[x×*])$/i.exec(s); return m ? [m[1], 'x' + (m[2] || m[3])] : [s, ''] }
 
   const show = id => {
     cur = id
@@ -98,15 +114,19 @@ if (document.body.classList.contains('app')) {
     show(lists.has(cur) ? cur : ls[0][0])
   }
 
+  // rows: [list, name, done (0 list / 1 ticked / -1 deleted), qty (undefined = keep)]
   const apply = (rows, full) => {
     if (full) for (const l of lists.values()) { l.items.clear(); l.todo.textContent = l.done.textContent = '' }
-    for (const [lid, name, d] of rows) {
+    for (const [lid, name, d, qty] of rows) {
       const l = lists.get(lid)
       if (!l) continue
       const k = name.toLowerCase()
       let it = l.items.get(k)
-      if (!it) l.items.set(k, it = { el: el('button', { textContent: name }) })
-      it.done = d; it.t = ++tick
+      if (d < 0) { if (it) { it.el.remove(); l.items.delete(k) } continue }
+      if (!it) l.items.set(k, it = { el: el('button', { className: 't' }), qty: '' })
+      it.el.textContent = name
+      if (qty !== undefined) it.el.dataset.q = it.qty = qty
+      it.done = d; it.n = ++tick
       it.el.ariaPressed = !!d
       ;(d ? l.done : l.todo).prepend(it.el)
     }
@@ -118,16 +138,35 @@ if (document.body.classList.contains('app')) {
       await new Promise(r => setTimeout(r, 2000)) // offline / flaky network: retry until it lands
     }
   }
+  // queued so changes land in order; `pending` keeps optimistic state out of the cache
+  const send = (path, body) => { pending++; queue = queue.then(() => post(path, body)).finally(() => pending--) }
 
-  const set = (name, d) => {
-    const lid = cur
-    apply([[lid, name, d]]); pending++
-    queue = queue.then(() => post('/set', [lid, name, d])).finally(() => pending--)
+  const set = (text, d) => {
+    const [name, qty] = parse(text)
+    apply([[cur, name, d, d ? undefined : qty]]) // ticking keeps the quantity, (re-)adding sets it
+    send('/set', [cur, text, d])
   }
+
+  const edit = name => {
+    const it = lists.get(cur).items.get(name.toLowerCase())
+    editing = [cur, name, it.done]
+    ei.value = name + (it.qty ? ' ' + it.qty : '')
+    ed.showModal()
+  }
+  ef.onsubmit = e => {
+    e.preventDefault()
+    const [lid, old, d] = editing, [name, qty] = parse(ei.value.trim())
+    // renaming onto another item merges into it (same as the server)
+    apply(name.toLowerCase() == old.toLowerCase() ? [[lid, name, d, qty]] : [[lid, old, -1], [lid, name, d, qty]])
+    send('/edit', [lid, old, ei.value.trim()])
+    ed.close()
+  }
+  edel.onclick = () => { const [lid, name] = editing; apply([[lid, name, -1]]); send('/delete', [lid, name]); ed.close() }
+  ed.onclick = e => { if (e.target == ed) ed.close() } // backdrop click
 
   const suggest = () => {
     const v = inp.value.trim().toLowerCase(), m = []
-    if (v) for (const [k, it] of lists.get(cur)?.items || []) if (it.done && k.includes(v)) m.push([!k.startsWith(v), -it.t, it.el.textContent])
+    if (v) for (const [k, it] of lists.get(cur)?.items || []) if (it.done && k.includes(v)) m.push([!k.startsWith(v), -it.n, it.el.textContent])
     m.sort((a, b) => a[0] - b[0] || a[1] - b[1])
     sug.replaceChildren(...m.slice(0, 8).map(x => el('button', { textContent: x[2] })))
   }
@@ -135,19 +174,26 @@ if (document.body.classList.contains('app')) {
   const save = () => {
     if (pending) return // don't persist optimistic state the server hasn't seen
     const ls = [...lists].map(([id, l]) => [id, l.tab.textContent])
-    const rows = [...lists].flatMap(([id, l]) => [...l.items.values()].map(it => [it.t, id, it.el.textContent, it.done]))
-    try { localStorage.c2 = JSON.stringify([rev, ls, rows.sort((a, b) => a[0] - b[0]).map(r => r.slice(1))]) } catch {}
+    const rows = [...lists].flatMap(([id, l]) => [...l.items.values()].map(it => [it.n, id, it.el.textContent, it.done, it.qty]))
+    try { localStorage.c3 = JSON.stringify([rev, ls, rows.sort((a, b) => a[0] - b[0]).map(r => r.slice(1))]) } catch {}
   }
 
-  try { localStorage.removeItem('c') } catch {} // v1 cache format
-  try { const [r, ls, rows] = JSON.parse(localStorage.c2); setLists(ls); apply(rows, 1); rev = r } catch {}
+  try { localStorage.removeItem('c'); localStorage.removeItem('c2') } catch {} // older cache formats
+  try { const [r, ls, rows] = JSON.parse(localStorage.c3); setLists(ls); apply(rows, 1); rev = r } catch {}
 
   const es = new EventSource('/events?since=' + rev)
   es.onmessage = e => { const [rows, full, ls] = JSON.parse(e.data); setLists(ls); apply(rows, full); rev = +e.lastEventId; suggest() }
   es.onerror = () => es.readyState == 2 && setTimeout(() => location.reload(), 2000)
 
   // braces, not `&&`: an on* handler returning false cancels the click
-  board.onclick = e => { const b = e.target; if (b.parentNode.parentNode == board) set(b.textContent, b.ariaPressed == 'true' ? 0 : 1) }
+  // tap the pencil (right 48px) to edit, anywhere else to tick; right-click / long-press / menu key also edit
+  board.onclick = e => {
+    const b = e.target
+    if (b.className != 't') return
+    if (e.detail && e.offsetX > b.clientWidth - 48) edit(b.textContent)
+    else set(b.textContent, b.ariaPressed == 'true' ? 0 : 1)
+  }
+  board.oncontextmenu = e => { if (e.target.className == 't') { e.preventDefault(); edit(e.target.textContent) } }
   sug.onclick = e => { if (e.target == sug) return; set(e.target.textContent, 0); inp.value = ''; suggest(); inp.focus() }
   inp.oninput = suggest
   add.onsubmit = e => { e.preventDefault(); const v = inp.value.trim(); if (v) set(v, 0); inp.value = ''; suggest() }
@@ -177,7 +223,6 @@ if (document.body.classList.contains('app')) {
   ub.onclick = () => { users.showModal(); loadUsers() }
   // no `&&` shortcut here: an on* handler returning false cancels the click (that broke the Add button)
   users.onclick = e => { if (e.target == users) users.close() } // backdrop click
-  add.onsubmit = e => { e.preventDefault(); const v = inp.value.trim(); if (v) set(v, 0); inp.value = ''; suggest() }
   nu.onsubmit = async e => {
     e.preventDefault()
     const r = await post('/users', [nu.u.value, nu.p.value])

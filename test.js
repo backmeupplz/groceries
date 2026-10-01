@@ -7,7 +7,7 @@ import { connect } from 'node:net'
 
 const PORT = 3999, base = `http://localhost:${PORT}`, DB = `${tmpdir()}/groceries-test-${Date.now()}.db`
 // start from a v1 (single list) DB to exercise the migration
-new DatabaseSync(DB).exec(`CREATE TABLE items(name TEXT PRIMARY KEY COLLATE NOCASE, done INT, rev INT); CREATE INDEX items_rev ON items(rev); INSERT INTO items VALUES('Bread', 1, 1)`)
+new DatabaseSync(DB).exec(`CREATE TABLE items(name TEXT PRIMARY KEY COLLATE NOCASE, done INT, rev INT); CREATE INDEX items_rev ON items(rev); INSERT INTO items VALUES('Bread', 1, 1), ('Eggs x2', 0, 2), ('Jam 3x', 1, 3)`)
 const srv = spawn('node', ['server.js'], { env: { ...process.env, PORT, DB, ADMIN_USER: 'me', ADMIN_PASSWORD: 'password1' }, stdio: 'inherit' })
 await new Promise(r => setTimeout(r, 500))
 
@@ -74,14 +74,40 @@ try {
     return [+/id: (\d+)/.exec(buf)[1], JSON.parse(/data: (.*)/.exec(buf)[1])]
   }
   const lists = [[1, 'Grocery'], [2, 'Sometime']]
+  // migration folded quantities out of old names (a ticked one drops its quantity)
   const [rev, all] = await events(0)
-  assert.deepEqual(all, [[[1, 'Bread', 1], [1, 'Milk', 1], [2, 'Milk', 0]], true, lists])
-  assert.deepEqual((await events(rev - 1))[1], [[[2, 'Milk', 0]], false, lists])
+  assert.deepEqual(all, [[[1, 'Bread', 1, ''], [1, 'Eggs', 0, 'x2'], [1, 'Jam', 1, ''], [1, 'Milk', 1, ''], [2, 'Milk', 0, '']], true, lists])
+  assert.deepEqual((await events(rev - 1))[1], [[[2, 'Milk', 0, '']], false, lists])
   assert.deepEqual((await events(rev + 1))[1], all) // stale cache -> full resync
+
+  // quantities: "x2" isn't part of the name; ticking keeps it, re-adding from history clears it
+  await post('/set', [2, 'Paint 2x', 0])
+  await post('/set', [2, 'paint', 1])
+  let r2 = await events(rev)
+  assert.deepEqual(r2[1][0], [[2, 'Paint', 1, 'x2']]) // deltas carry current state, one row per item
+  await post('/set', [2, 'Paint', 0])
+  assert.deepEqual((await events(r2[0]))[1][0], [[2, 'Paint', 0, '']])
+
+  // non-ASCII case-folding: one item, not two
+  await post('/set', [2, 'Молоко', 0])
+  await post('/set', [2, 'молоко ×3', 0])
+  const cyr = (await events(0))[1][0].filter(x => x[1].toLowerCase() == 'молоко')
+  assert.deepEqual(cyr, [[2, 'Молоко', 0, 'x3']])
+
+  // edit: change quantity + casing; rename onto another item merges; delete leaves a tombstone in deltas only
+  const before = (await events(0))[0]
+  assert.equal((await post('/edit', [2, 'paint', 'PAINT x5'])).status, 204)
+  assert.equal((await post('/edit', [2, 'PAINT', 'Milk x2'])).status, 204)
+  assert.equal((await post('/edit', [2, 'nope', 'x'])).status, 404)
+  assert.equal((await post('/delete', [2, 'молоко'])).status, 204)
+  assert.deepEqual((await events(before))[1][0], [[2, 'PAINT', -1, 'x5'], [2, 'Milk', 0, 'x2'], [2, 'Молоко', -1, 'x3']])
+  assert.deepEqual((await events(0))[1][0].filter(x => x[0] == 2), [[2, 'Milk', 0, 'x2']])
+  await post('/set', [2, 'молоко', 0]) // re-adding a deleted item brings it back
+  assert.deepEqual((await events(0))[1][0].filter(x => x[0] == 2).map(x => x[1]), ['Milk', 'молоко'])
 
   assert.equal((await post('/lists/delete', [2])).status, 204)
   assert.equal((await post('/lists/delete', [1])).status, 400) // last list stays
-  assert.deepEqual((await events(0))[1], [[[1, 'Bread', 1], [1, 'Milk', 1]], true, [[1, 'Grocery']]])
+  assert.deepEqual((await events(0))[1], [[[1, 'Bread', 1, ''], [1, 'Eggs', 0, 'x2'], [1, 'Jam', 1, ''], [1, 'Milk', 1, '']], true, [[1, 'Grocery']]])
   assert.equal((await fetch(base + '/logout', { method: 'POST', headers, redirect: 'manual' })).status, 303)
   assert.equal((await fetch(base + '/events', { headers })).status, 401)
   console.log('ok')

@@ -13,12 +13,23 @@ DELETE FROM sessions WHERE length(token) != 64; -- pre-hashing plaintext tokens
 CREATE TABLE IF NOT EXISTS lists(id INTEGER PRIMARY KEY, name TEXT UNIQUE COLLATE NOCASE);
 INSERT INTO lists(name) SELECT 'Grocery' WHERE NOT EXISTS (SELECT 1 FROM lists);`)
 const q = sql => db.prepare(sql)
-// v1 had one list: move its items into the first list
-const v1 = q("SELECT 1 FROM pragma_table_info('items') WHERE name = 'name'").get() && !q("SELECT 1 FROM pragma_table_info('items') WHERE name = 'list'").get()
-db.exec(`BEGIN;${v1 ? 'ALTER TABLE items RENAME TO items_v1; DROP INDEX items_rev;' : ''}
-CREATE TABLE IF NOT EXISTS items(list INT, name TEXT COLLATE NOCASE, done INT, rev INT, PRIMARY KEY(list, name));
-CREATE INDEX IF NOT EXISTS items_rev ON items(rev);
-${v1 ? 'INSERT INTO items SELECT (SELECT MIN(id) FROM lists), name, done, rev FROM items_v1; DROP TABLE items_v1;' : ''}COMMIT`)
+
+// "eggs x2" / "eggs 2x" / "eggs ×2" -> ["eggs", "x2"]: the quantity isn't part of the name (history, suggestions).
+// Same regex lives in index.html.
+const parse = s => { const m = /^(.+?)\s+(?:[x×*]\s*(\d+)|(\d+)\s*[x×*])$/i.exec(s); return m ? [m[1], 'x' + (m[2] || m[3])] : [s, ''] }
+// Items are keyed by JS-lowercased name: SQLite NOCASE only folds ASCII, so "Молоко"/"молоко" would split.
+const key = s => s.toLowerCase()
+// Migrate older schemas (v1: single list; v2: name-keyed, quantity inside the name) to the current one.
+const cols = q("SELECT name FROM pragma_table_info('items')").all().map(r => r.name)
+if (!cols.includes('k')) {
+  const old = cols.length ? q(`SELECT ${cols.includes('list') ? 'list' : '(SELECT MIN(id) FROM lists) list'}, name, done, rev FROM items ORDER BY rev`).all() : []
+  db.exec(`BEGIN; DROP TABLE IF EXISTS items;
+CREATE TABLE items(list INT, k TEXT, name TEXT, done INT, qty TEXT, rev INT, PRIMARY KEY(list, k));
+CREATE INDEX items_rev ON items(rev);`)
+  const ins = q('INSERT INTO items VALUES(?, ?, ?, ?, ?, ?) ON CONFLICT DO UPDATE SET name = excluded.name, done = excluded.done, qty = excluded.qty, rev = excluded.rev')
+  for (const r of old) { const [name, qty] = parse(r.name); ins.run(r.list, key(name), name, r.done, r.done ? '' : qty, r.rev) }
+  db.exec('COMMIT')
+}
 const userCount = q('SELECT COUNT(*) n FROM users')
 const addUser = q('INSERT OR IGNORE INTO users VALUES(?, ?)')
 const getUser = q('SELECT hash FROM users WHERE name = ?')
@@ -33,9 +44,21 @@ const getList = q('SELECT 1 FROM lists WHERE id = ?')
 const addList = q('INSERT OR IGNORE INTO lists(name) VALUES(?)')
 const delList = q('DELETE FROM lists WHERE id = ?')
 const delItems = q('DELETE FROM items WHERE list = ?')
-const upsert = q('INSERT INTO items VALUES(?, ?, ?, ?) ON CONFLICT DO UPDATE SET done = excluded.done, rev = excluded.rev RETURNING list, name, done')
-const changes = q('SELECT list, name, done FROM items WHERE rev > ? ORDER BY rev')
+// done: 0 = on the list, 1 = ticked (history), -1 = deleted (kept as a tombstone so cached clients drop it)
+const put = q(`INSERT INTO items VALUES(?, ?, ?, ?, ?, ?) ON CONFLICT DO UPDATE
+  SET name = excluded.name, done = excluded.done, qty = excluded.qty, rev = excluded.rev RETURNING list, name, done, qty`)
+// Ticking keeps the quantity; adding/re-adding sets it (re-add from history = no quantity). A deleted item re-added takes the new spelling.
+const upsert = q(`INSERT INTO items VALUES(?, ?, ?, ?, ?, ?) ON CONFLICT DO UPDATE SET
+  name = CASE WHEN done < 0 THEN excluded.name ELSE name END, done = excluded.done,
+  qty = CASE WHEN excluded.done = 1 THEN qty ELSE excluded.qty END, rev = excluded.rev RETURNING list, name, done, qty`)
+const getItem = q('SELECT name, done, qty FROM items WHERE list = ? AND k = ? AND done >= 0')
+const rename = q('UPDATE items SET name = ?, qty = ?, rev = ? WHERE list = ? AND k = ? RETURNING list, name, done, qty')
+const tomb = q('UPDATE items SET done = -1, rev = ? WHERE list = ? AND k = ? AND done >= 0 RETURNING list, name, done, qty')
+const changes = q('SELECT list, name, done, qty FROM items WHERE rev > ? ORDER BY rev')
+const snapshot = q('SELECT list, name, done, qty FROM items WHERE done >= 0 ORDER BY rev')
 let rev = q('SELECT IFNULL(MAX(rev), 0) r FROM items').get().r
+// Timestamp-based so rev never goes backwards across restarts, even after a list delete drops the newest rows.
+const nextRev = () => rev = Math.max(rev + 1, Date.now())
 
 // Async scrypt runs on the threadpool, so login attempts can't freeze the event loop.
 const scryptAsync = promisify(scrypt)
@@ -72,7 +95,7 @@ const pageHeaders = {
 }
 const clients = new Set()
 // Every event carries the full (tiny) lists array, so list adds/deletes need no extra sync.
-const event = (rows, full) => `id: ${rev}\ndata: ${JSON.stringify([rows.map(r => [r.list, r.name, r.done]), full, allLists.all().map(l => [l.id, l.name])])}\n\n`
+const event = (rows, full) => `id: ${rev}\ndata: ${JSON.stringify([rows.map(r => [r.list, r.name, r.done, r.qty]), full, allLists.all().map(l => [l.id, l.name])])}\n\n`
 const broadcast = rows => clients.forEach(c => c.send(event(rows)))
 setInterval(() => clients.forEach(c => c.send(':\n\n')), 25000)
 
@@ -141,20 +164,38 @@ const handle = async (req, res) => {
     const out = gzip ? createGzip() : res
     if (gzip) out.pipe(res)
     const send = s => { out.write(s); gzip && out.flush() }
-    send('retry: 2000\n' + event(changes.all(since), !since))
+    send('retry: 2000\n' + event(since ? changes.all(since) : snapshot.all(), !since))
     const c = { user, sid, send, end: () => res.end() }
     clients.add(c)
     return req.on('close', () => clients.delete(c))
   }
 
   if (req.method == 'POST' && url.pathname == '/set') {
-    const [list, n, done] = await json(req)
-    const name = str(n, 200)
+    const [list, text, done] = await json(req)
+    const [name, qty] = parse(str(text, 200) || '')
     if (!name) return end(400)
     if (!Number.isInteger(list) || !getList.get(list)) return end(404)
-    // Timestamp-based so rev never goes backwards across restarts, even after a list delete drops the newest rows.
-    rev = Math.max(rev + 1, Date.now())
-    broadcast([upsert.get(list, name, done ? 1 : 0, rev)])
+    broadcast([upsert.get(list, key(name), name, done ? 1 : 0, qty, nextRev())])
+    return end(204)
+  }
+
+  // Rename and/or change quantity. Renaming onto another existing item merges into it.
+  if (req.method == 'POST' && url.pathname == '/edit') {
+    const [list, old, text] = await json(req)
+    const [name, qty] = parse(str(text, 200) || '')
+    if (!name || typeof old != 'string' || !Number.isInteger(list)) return end(400)
+    const it = getItem.get(list, key(old))
+    if (!it) return end(404)
+    if (key(name) == key(old)) broadcast([rename.get(name, qty, nextRev(), list, key(old))])
+    else broadcast([tomb.get(nextRev(), list, key(old)), put.get(list, key(name), name, it.done, qty, nextRev())])
+    return end(204)
+  }
+
+  if (req.method == 'POST' && url.pathname == '/delete') {
+    const [list, name] = await json(req)
+    if (!Number.isInteger(list) || typeof name != 'string') return end(400)
+    const row = tomb.get(nextRev(), list, key(name))
+    if (row) broadcast([row])
     return end(204)
   }
 
