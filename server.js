@@ -1,0 +1,94 @@
+import { createServer } from 'node:http'
+import { DatabaseSync } from 'node:sqlite'
+import { scryptSync, randomBytes, timingSafeEqual } from 'node:crypto'
+import { readFileSync } from 'node:fs'
+import { gzipSync, createGzip } from 'node:zlib'
+
+const db = new DatabaseSync(process.env.DB || 'groceries.db')
+db.exec(`PRAGMA journal_mode=WAL;
+CREATE TABLE IF NOT EXISTS users(name TEXT PRIMARY KEY, hash TEXT);
+CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY, user TEXT);
+CREATE TABLE IF NOT EXISTS items(name TEXT PRIMARY KEY COLLATE NOCASE, done INT, rev INT);
+CREATE INDEX IF NOT EXISTS items_rev ON items(rev);`)
+const q = sql => db.prepare(sql)
+const userCount = q('SELECT COUNT(*) n FROM users')
+const addUser = q('INSERT OR IGNORE INTO users VALUES(?, ?)')
+const getUser = q('SELECT hash FROM users WHERE name = ?')
+const addSession = q('INSERT INTO sessions VALUES(?, ?)')
+const getSession = q('SELECT user FROM sessions WHERE token = ?')
+const upsert = q('INSERT INTO items VALUES(?, ?, ?) ON CONFLICT DO UPDATE SET done = excluded.done, rev = excluded.rev RETURNING name, done')
+const changes = q('SELECT name, done FROM items WHERE rev > ? ORDER BY rev')
+let rev = q('SELECT IFNULL(MAX(rev), 0) r FROM items').get().r
+
+const hash = (p, salt = randomBytes(16).toString('hex')) => salt + ':' + scryptSync(p, salt, 32).toString('hex')
+const verify = (p, h) => !!h && timingSafeEqual(Buffer.from(hash(p, h.split(':')[0])), Buffer.from(h))
+const str = (s, max) => typeof s == 'string' && (s = s.trim()) && s.length <= max ? s : null
+
+const html = readFileSync(new URL('index.html', import.meta.url), 'utf8')
+const clients = new Set()
+const event = (rows, full) => `id: ${rev}\ndata: ${JSON.stringify([rows.map(r => [r.name, r.done]), full])}\n\n`
+setInterval(() => clients.forEach(send => send(':\n\n')), 25000)
+
+const body = req => new Promise((ok, fail) => {
+  let b = ''
+  req.on('data', c => (b += c).length > 1e4 && req.destroy())
+  req.on('end', () => ok(b)).on('error', fail)
+})
+const json = async req => { try { return JSON.parse(await body(req)) } catch { return [] } }
+
+createServer(async (req, res) => {
+  const url = new URL(req.url, 'http://x')
+  const gzip = /gzip/.test(req.headers['accept-encoding'])
+  const token = /(?:^|; )s=(\w+)/.exec(req.headers.cookie)?.[1]
+  const user = token && getSession.get(token)?.user
+  const end = (code, headers = {}, b) => res.writeHead(code, headers).end(b)
+
+  if (req.method == 'GET' && url.pathname == '/') {
+    const cls = !userCount.get().n ? 'setup' : !user ? 'login' : 'app'
+    const page = html.replace('<body>', `<body class="${cls}${url.search == '?bad' ? ' bad' : ''}">`)
+    return end(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', ...gzip && { 'content-encoding': 'gzip' } }, gzip ? gzipSync(page) : page)
+  }
+
+  if (req.method == 'POST' && url.pathname == '/login') {
+    const f = new URLSearchParams(await body(req))
+    const u = str(f.get('u'), 50), p = f.get('p')
+    // First visitor on an empty DB creates the first user.
+    if (u && p && !userCount.get().n) addUser.run(u, hash(p))
+    if (!u || !p || !verify(p, getUser.get(u)?.hash)) return end(303, { location: '/?bad' })
+    const t = randomBytes(24).toString('hex')
+    addSession.run(t, u)
+    return end(303, { location: '/', 'set-cookie': `s=${t}; HttpOnly; SameSite=Lax; Path=/; Max-Age=31536000` })
+  }
+
+  if (!user) return end(401)
+
+  if (url.pathname == '/events') {
+    let since = +(req.headers['last-event-id'] ?? url.searchParams.get('since')) || 0
+    if (since > rev) since = 0 // DB was reset, client cache is stale
+    res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-store', ...gzip && { 'content-encoding': 'gzip' } })
+    const out = gzip ? createGzip() : res
+    if (gzip) out.pipe(res)
+    const send = s => { out.write(s); gzip && out.flush() }
+    send('retry: 2000\n' + event(changes.all(since), !since))
+    clients.add(send)
+    return req.on('close', () => clients.delete(send))
+  }
+
+  if (req.method == 'POST' && url.pathname == '/set') {
+    const [n, done] = await json(req)
+    const name = str(n, 200)
+    if (!name) return end(400)
+    const row = upsert.get(name, done ? 1 : 0, ++rev)
+    clients.forEach(send => send(event([row])))
+    return end(204)
+  }
+
+  if (req.method == 'POST' && url.pathname == '/users') {
+    const [n, p] = await json(req)
+    const name = str(n, 50)
+    if (!name || typeof p != 'string' || !p) return end(400)
+    return end(addUser.run(name, hash(p)).changes ? 204 : 409)
+  }
+
+  end(404)
+}).listen(process.env.PORT || 3000, () => console.log(`http://localhost:${process.env.PORT || 3000}`))

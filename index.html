@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#111">
+<title>Groceries</title>
+<style>
+* { box-sizing: border-box; margin: 0; font: inherit; color: inherit }
+body { background: #111; color: #ddd; font: 17px/1.4 system-ui, sans-serif; max-width: 40rem; margin: auto; -webkit-tap-highlight-color: transparent }
+button { background: none; border: 0; cursor: pointer; touch-action: manipulation }
+input { width: 100%; background: #1b1b1b; border: 1px solid #333; border-radius: 8px; padding: .7rem .9rem; outline: 0 }
+input:focus { border-color: #555 }
+#auth, #app, #first, #bad { display: none }
+.login #auth, .setup #auth { display: flex } .app #app, .setup #first, .bad #bad { display: block }
+#auth { flex-direction: column; gap: .75rem; padding: 20vh 1rem 0 }
+#auth button, footer button { background: #ddd; color: #111; border-radius: 8px; padding: .7rem }
+#bad { color: #e66 }
+header { position: sticky; top: 0; background: #111; padding: .75rem; z-index: 1 }
+#sug button { border: 1px solid #333; border-radius: 99px; padding: .3rem .8rem; margin: .5rem .4rem 0 0 }
+#todo button, #done button { display: block; width: 100%; text-align: left; padding: .75rem 1rem; border-bottom: 1px solid #1e1e1e; content-visibility: auto; contain-intrinsic-size: auto 2.9rem; overflow-wrap: anywhere }
+#done button { color: #555; text-decoration: line-through }
+#done:not(:empty) { border-top: 1px solid #333 }
+footer { padding: 2rem 1rem; color: #555 }
+footer form { display: grid; gap: .5rem; margin-top: .75rem }
+</style>
+<body>
+<form id="auth" method="post" action="/login">
+  <p id="first">Create the first user</p>
+  <p id="bad">Wrong login or password</p>
+  <input name="u" placeholder="login" autocomplete="username" autocapitalize="off" required>
+  <input name="p" type="password" placeholder="password" autocomplete="current-password" required>
+  <button>Go</button>
+</form>
+<main id="app">
+  <header><form id="add"><input id="inp" placeholder="Add item" autocomplete="off" enterkeyhint="done"></form><div id="sug"></div></header>
+  <div id="todo"></div><div id="done"></div>
+  <footer><details><summary>Add user</summary><form id="nu">
+    <input name="u" placeholder="login" autocomplete="off" autocapitalize="off" required>
+    <input name="p" type="password" placeholder="password" autocomplete="new-password" required>
+    <button>Add</button>
+  </form></details></footer>
+</main>
+<script>
+if (document.body.classList.contains('app')) {
+  const items = new Map // lowercase name -> { el, done, t }
+  let rev = 0, tick = 0, pending = 0, queue = Promise.resolve()
+
+  const apply = (rows, full) => {
+    if (full) { items.clear(); todo.textContent = done.textContent = '' }
+    for (const [name, d] of rows) {
+      const k = name.toLowerCase()
+      let it = items.get(k)
+      if (!it) { const el = document.createElement('button'); el.textContent = name; items.set(k, it = { el }) }
+      it.done = d; it.t = ++tick
+      it.el.ariaPressed = !!d
+      ;(d ? done : todo).prepend(it.el)
+    }
+  }
+
+  const post = async (path, body) => {
+    for (;;) {
+      try { const r = await fetch(path, { method: 'POST', body: JSON.stringify(body) }); if (r.status == 401) location.reload(); return r } catch {}
+      await new Promise(r => setTimeout(r, 2000)) // offline / flaky network: retry until it lands
+    }
+  }
+
+  const set = (name, d) => {
+    apply([[name, d]]); pending++
+    queue = queue.then(() => post('/set', [name, d])).finally(() => pending--)
+  }
+
+  const suggest = () => {
+    const v = inp.value.trim().toLowerCase(), m = []
+    if (v) for (const [k, it] of items) if (it.done && k.includes(v)) m.push([!k.startsWith(v), -it.t, it.el.textContent])
+    m.sort((a, b) => a[0] - b[0] || a[1] - b[1])
+    sug.replaceChildren(...m.slice(0, 8).map(x => Object.assign(document.createElement('button'), { textContent: x[2] })))
+  }
+
+  const save = () => {
+    if (pending) return // don't persist optimistic state the server hasn't seen
+    try { localStorage.c = JSON.stringify([rev, [...items.values()].sort((a, b) => a.t - b.t).map(it => [it.el.textContent, it.done])]) } catch {}
+  }
+
+  try { const [r, rows] = JSON.parse(localStorage.c); apply(rows, 1); rev = r } catch {}
+
+  const es = new EventSource('/events?since=' + rev)
+  es.onmessage = e => { const [rows, full] = JSON.parse(e.data); apply(rows, full); rev = +e.lastEventId; suggest() }
+  es.onerror = () => es.readyState == 2 && setTimeout(() => location.reload(), 2000)
+
+  todo.onclick = e => e.target != todo && set(e.target.textContent, 1)
+  done.onclick = e => e.target != done && set(e.target.textContent, 0)
+  sug.onclick = e => { if (e.target == sug) return; set(e.target.textContent, 0); inp.value = ''; suggest(); inp.focus() }
+  inp.oninput = suggest
+  add.onsubmit = e => { e.preventDefault(); const v = inp.value.trim(); if (v) set(v, 0); inp.value = ''; suggest() }
+  nu.onsubmit = async e => {
+    e.preventDefault()
+    const r = await post('/users', [nu.u.value, nu.p.value])
+    alert(r.ok ? 'User added' : r.status == 409 ? 'User exists' : 'Failed')
+    if (r.ok) nu.reset()
+  }
+  addEventListener('visibilitychange', () => document.hidden && save())
+  addEventListener('pagehide', save)
+}
+</script>
