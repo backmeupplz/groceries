@@ -161,7 +161,11 @@ if (document.body.classList.contains('app')) {
     send('/edit', [lid, old, ei.value.trim()])
     ed.close()
   }
-  edel.onclick = () => { const [lid, name] = editing; apply([[lid, name, -1]]); send('/delete', [lid, name]); ed.close() }
+  edel.onclick = () => {
+    const [lid, name] = editing
+    if (!confirm(`Delete "${name}"?`)) return
+    apply([[lid, name, -1]]); send('/delete', [lid, name]); ed.close()
+  }
   ed.onclick = e => { if (e.target == ed) ed.close() } // backdrop click
 
   const suggest = () => {
