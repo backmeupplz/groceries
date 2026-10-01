@@ -17,6 +17,9 @@ const getUser = q('SELECT hash FROM users WHERE name = ?')
 const addSession = q('INSERT INTO sessions VALUES(?, ?)')
 const getSession = q('SELECT user FROM sessions WHERE token = ?')
 const delSession = q('DELETE FROM sessions WHERE token = ?')
+const listUsers = q('SELECT name FROM users ORDER BY name')
+const delUser = q('DELETE FROM users WHERE name = ?')
+const delSessions = q('DELETE FROM sessions WHERE user = ?')
 const upsert = q('INSERT INTO items VALUES(?, ?, ?) ON CONFLICT DO UPDATE SET done = excluded.done, rev = excluded.rev RETURNING name, done')
 const changes = q('SELECT name, done FROM items WHERE rev > ? ORDER BY rev')
 let rev = q('SELECT IFNULL(MAX(rev), 0) r FROM items').get().r
@@ -28,7 +31,7 @@ const str = (s, max) => typeof s == 'string' && (s = s.trim()) && s.length <= ma
 const html = readFileSync(new URL('index.html', import.meta.url), 'utf8')
 const clients = new Set()
 const event = (rows, full) => `id: ${rev}\ndata: ${JSON.stringify([rows.map(r => [r.name, r.done]), full])}\n\n`
-setInterval(() => clients.forEach(send => send(':\n\n')), 25000)
+setInterval(() => clients.forEach(c => c.send(':\n\n')), 25000)
 
 const body = req => new Promise((ok, fail) => {
   let b = ''
@@ -76,8 +79,9 @@ createServer(async (req, res) => {
     if (gzip) out.pipe(res)
     const send = s => { out.write(s); gzip && out.flush() }
     send('retry: 2000\n' + event(changes.all(since), !since))
-    clients.add(send)
-    return req.on('close', () => clients.delete(send))
+    const c = { user, send, end: () => res.end() }
+    clients.add(c)
+    return req.on('close', () => clients.delete(c))
   }
 
   if (req.method == 'POST' && url.pathname == '/set') {
@@ -85,7 +89,19 @@ createServer(async (req, res) => {
     const name = str(n, 200)
     if (!name) return end(400)
     const row = upsert.get(name, done ? 1 : 0, ++rev)
-    clients.forEach(send => send(event([row])))
+    clients.forEach(c => c.send(event([row])))
+    return end(204)
+  }
+
+  if (req.method == 'GET' && url.pathname == '/users')
+    return end(200, { 'content-type': 'application/json' }, JSON.stringify([user, listUsers.all().map(r => r.name)]))
+
+  if (req.method == 'POST' && url.pathname == '/users/delete') {
+    const [name] = await json(req)
+    if (typeof name != 'string' || name == user) return end(400) // can't delete yourself, so someone always remains
+    delUser.run(name)
+    delSessions.run(name)
+    clients.forEach(c => c.user == name && c.end()) // kicks their live stream -> 401 -> login page
     return end(204)
   }
 

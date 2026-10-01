@@ -22,7 +22,13 @@ try {
 
   assert.equal((await post('/users', ['wife', 'pw2'])).status, 204)
   assert.equal((await post('/users', ['wife', 'x'])).status, 409)
-  assert.ok((await login('wife', 'pw2'))[1])
+  const [, wifeCookie] = await login('wife', 'pw2')
+  assert.ok(wifeCookie)
+  assert.deepEqual(await (await fetch(base + '/users', { headers })).json(), ['me', ['me', 'wife']])
+  assert.equal((await post('/users/delete', ['me'])).status, 400)
+  assert.equal((await post('/users/delete', ['wife'])).status, 204)
+  assert.equal((await fetch(base + '/events', { headers: { cookie: wifeCookie } })).status, 401)
+  assert.equal((await login('wife', 'pw2'))[0], '/?bad')
 
   await post('/set', ['Milk', 0])
   await post('/set', ['milk', 1]) // same item, case-insensitive; keeps "Milk"

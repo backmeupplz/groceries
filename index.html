@@ -24,7 +24,13 @@ svg { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-width:
 dialog { background: #1b1b1b; border: 1px solid #333; border-radius: 12px; padding: 0; width: min(22rem, calc(100% - 2rem)); margin: auto }
 dialog::backdrop { background: #000a }
 dialog input { background: #111 }
-#nu { display: grid; gap: .6rem; padding: 1rem }
+#uw, #nu { display: grid; gap: .6rem }
+#uw { padding: 1rem }
+#ul { list-style: none; padding: 0; margin-bottom: .4rem }
+#ul li { display: flex; justify-content: space-between; align-items: center; min-height: 2.5rem; border-bottom: 1px solid #2a2a2a }
+#ul li span { color: #666 }
+#ul button { display: flex; padding: .4rem; color: #888 }
+#ul svg { width: 18px; height: 18px }
 #bad { color: #e66 }
 header { position: sticky; top: 0; background: #111; padding: .75rem; z-index: 1 }
 #sug button { border: 1px solid #333; border-radius: 99px; padding: .3rem .8rem; margin: .5rem .4rem 0 0 }
@@ -50,12 +56,15 @@ header { position: sticky; top: 0; background: #111; padding: .75rem; z-index: 1
     </nav>
     <form id="add"><input id="inp" placeholder="Add item" autocomplete="off" enterkeyhint="done"></form><div id="sug"></div></header>
   <div id="todo"></div><div id="done"></div>
-  <dialog id="users"><form id="nu">
-    <h2>Add user</h2>
-    <input name="u" placeholder="login" autocomplete="off" autocapitalize="off" required>
-    <input name="p" type="password" placeholder="password" autocomplete="new-password" required>
-    <button>Add</button>
-  </form></dialog>
+  <dialog id="users"><div id="uw">
+    <h2>Users</h2>
+    <ul id="ul"></ul>
+    <form id="nu">
+      <input name="u" placeholder="login" autocomplete="off" autocapitalize="off" required>
+      <input name="p" type="password" placeholder="password" autocomplete="new-password" required>
+      <button>Add user</button>
+    </form>
+  </div></dialog>
 </main>
 <script>
 if (document.body.classList.contains('app')) {
@@ -108,14 +117,28 @@ if (document.body.classList.contains('app')) {
   done.onclick = e => e.target != done && set(e.target.textContent, 0)
   sug.onclick = e => { if (e.target == sug) return; set(e.target.textContent, 0); inp.value = ''; suggest(); inp.focus() }
   inp.oninput = suggest
-  ub.onclick = () => users.showModal()
-  users.onclick = e => e.target == users && users.close() // backdrop click
+  const loadUsers = async () => {
+    const [me, names] = await (await fetch('/users')).json()
+    ul.replaceChildren(...names.map(n => {
+      const li = document.createElement('li')
+      li.textContent = n
+      if (n == me) li.append(Object.assign(document.createElement('span'), { textContent: 'you' }))
+      else li.append(Object.assign(document.createElement('button'), {
+        title: 'Remove', ariaLabel: 'Remove ' + n, innerHTML: '<svg viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg>',
+        onclick: async () => { if (confirm(`Remove ${n}?`)) { await post('/users/delete', [n]); loadUsers() } }
+      }))
+      return li
+    }))
+  }
+  ub.onclick = () => { users.showModal(); loadUsers() }
+  // no `&&` shortcut here: an on* handler returning false cancels the click (that broke the Add button)
+  users.onclick = e => { if (e.target == users) users.close() } // backdrop click
   add.onsubmit = e => { e.preventDefault(); const v = inp.value.trim(); if (v) set(v, 0); inp.value = ''; suggest() }
   nu.onsubmit = async e => {
     e.preventDefault()
     const r = await post('/users', [nu.u.value, nu.p.value])
-    alert(r.ok ? 'User added' : r.status == 409 ? 'User exists' : 'Failed')
-    if (r.ok) { nu.reset(); users.close() }
+    if (!r.ok) return alert(r.status == 409 ? 'User exists' : 'Failed')
+    nu.reset(); loadUsers()
   }
   addEventListener('visibilitychange', () => document.hidden && save())
   addEventListener('pagehide', save)
