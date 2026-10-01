@@ -8,9 +8,15 @@ const db = new DatabaseSync(process.env.DB || 'groceries.db')
 db.exec(`PRAGMA journal_mode=WAL;
 CREATE TABLE IF NOT EXISTS users(name TEXT PRIMARY KEY, hash TEXT);
 CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY, user TEXT);
-CREATE TABLE IF NOT EXISTS items(name TEXT PRIMARY KEY COLLATE NOCASE, done INT, rev INT);
-CREATE INDEX IF NOT EXISTS items_rev ON items(rev);`)
+CREATE TABLE IF NOT EXISTS lists(id INTEGER PRIMARY KEY, name TEXT UNIQUE COLLATE NOCASE);
+INSERT INTO lists(name) SELECT 'Grocery' WHERE NOT EXISTS (SELECT 1 FROM lists);`)
 const q = sql => db.prepare(sql)
+// v1 had one list: move its items into the first list
+const v1 = q("SELECT 1 FROM pragma_table_info('items') WHERE name = 'name'").get() && !q("SELECT 1 FROM pragma_table_info('items') WHERE name = 'list'").get()
+db.exec(`BEGIN;${v1 ? 'ALTER TABLE items RENAME TO items_v1; DROP INDEX items_rev;' : ''}
+CREATE TABLE IF NOT EXISTS items(list INT, name TEXT COLLATE NOCASE, done INT, rev INT, PRIMARY KEY(list, name));
+CREATE INDEX IF NOT EXISTS items_rev ON items(rev);
+${v1 ? 'INSERT INTO items SELECT (SELECT MIN(id) FROM lists), name, done, rev FROM items_v1; DROP TABLE items_v1;' : ''}COMMIT`)
 const userCount = q('SELECT COUNT(*) n FROM users')
 const addUser = q('INSERT OR IGNORE INTO users VALUES(?, ?)')
 const getUser = q('SELECT hash FROM users WHERE name = ?')
@@ -20,8 +26,13 @@ const delSession = q('DELETE FROM sessions WHERE token = ?')
 const listUsers = q('SELECT name FROM users ORDER BY name')
 const delUser = q('DELETE FROM users WHERE name = ?')
 const delSessions = q('DELETE FROM sessions WHERE user = ?')
-const upsert = q('INSERT INTO items VALUES(?, ?, ?) ON CONFLICT DO UPDATE SET done = excluded.done, rev = excluded.rev RETURNING name, done')
-const changes = q('SELECT name, done FROM items WHERE rev > ? ORDER BY rev')
+const allLists = q('SELECT id, name FROM lists ORDER BY id')
+const getList = q('SELECT 1 FROM lists WHERE id = ?')
+const addList = q('INSERT OR IGNORE INTO lists(name) VALUES(?)')
+const delList = q('DELETE FROM lists WHERE id = ?')
+const delItems = q('DELETE FROM items WHERE list = ?')
+const upsert = q('INSERT INTO items VALUES(?, ?, ?, ?) ON CONFLICT DO UPDATE SET done = excluded.done, rev = excluded.rev RETURNING list, name, done')
+const changes = q('SELECT list, name, done FROM items WHERE rev > ? ORDER BY rev')
 let rev = q('SELECT IFNULL(MAX(rev), 0) r FROM items').get().r
 
 const hash = (p, salt = randomBytes(16).toString('hex')) => salt + ':' + scryptSync(p, salt, 32).toString('hex')
@@ -30,7 +41,9 @@ const str = (s, max) => typeof s == 'string' && (s = s.trim()) && s.length <= ma
 
 const html = readFileSync(new URL('index.html', import.meta.url), 'utf8')
 const clients = new Set()
-const event = (rows, full) => `id: ${rev}\ndata: ${JSON.stringify([rows.map(r => [r.name, r.done]), full])}\n\n`
+// Every event carries the full (tiny) lists array, so list adds/deletes need no extra sync.
+const event = (rows, full) => `id: ${rev}\ndata: ${JSON.stringify([rows.map(r => [r.list, r.name, r.done]), full, allLists.all().map(l => [l.id, l.name])])}\n\n`
+const broadcast = rows => clients.forEach(c => c.send(event(rows)))
 setInterval(() => clients.forEach(c => c.send(':\n\n')), 25000)
 
 const body = req => new Promise((ok, fail) => {
@@ -85,11 +98,31 @@ createServer(async (req, res) => {
   }
 
   if (req.method == 'POST' && url.pathname == '/set') {
-    const [n, done] = await json(req)
+    const [list, n, done] = await json(req)
     const name = str(n, 200)
     if (!name) return end(400)
-    const row = upsert.get(name, done ? 1 : 0, ++rev)
-    clients.forEach(c => c.send(event([row])))
+    if (!Number.isInteger(list) || !getList.get(list)) return end(404)
+    // Timestamp-based so rev never goes backwards across restarts, even after a list delete drops the newest rows.
+    rev = Math.max(rev + 1, Date.now())
+    broadcast([upsert.get(list, name, done ? 1 : 0, rev)])
+    return end(204)
+  }
+
+  if (req.method == 'POST' && url.pathname == '/lists') {
+    const name = str((await json(req))[0], 50)
+    if (!name) return end(400)
+    const r = addList.run(name)
+    if (!r.changes) return end(409)
+    broadcast([])
+    return end(200, {}, String(r.lastInsertRowid))
+  }
+
+  if (req.method == 'POST' && url.pathname == '/lists/delete') {
+    const [id] = await json(req)
+    if (!Number.isInteger(id) || allLists.all().length < 2) return end(400) // always keep one list
+    delItems.run(id)
+    delList.run(id)
+    broadcast([])
     return end(204)
   }
 

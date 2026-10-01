@@ -2,9 +2,12 @@
 import { spawn } from 'node:child_process'
 import assert from 'node:assert'
 import { tmpdir } from 'node:os'
+import { DatabaseSync } from 'node:sqlite'
 
-const PORT = 3999, base = `http://localhost:${PORT}`
-const srv = spawn('node', ['server.js'], { env: { ...process.env, PORT, DB: `${tmpdir()}/groceries-test-${Date.now()}.db` }, stdio: 'inherit' })
+const PORT = 3999, base = `http://localhost:${PORT}`, DB = `${tmpdir()}/groceries-test-${Date.now()}.db`
+// start from a v1 (single list) DB to exercise the migration
+new DatabaseSync(DB).exec(`CREATE TABLE items(name TEXT PRIMARY KEY COLLATE NOCASE, done INT, rev INT); CREATE INDEX items_rev ON items(rev); INSERT INTO items VALUES('Bread', 1, 1)`)
+const srv = spawn('node', ['server.js'], { env: { ...process.env, PORT, DB }, stdio: 'inherit' })
 await new Promise(r => setTimeout(r, 500))
 
 const login = async (u, p) => {
@@ -30,9 +33,13 @@ try {
   assert.equal((await fetch(base + '/events', { headers: { cookie: wifeCookie } })).status, 401)
   assert.equal((await login('wife', 'pw2'))[0], '/?bad')
 
-  await post('/set', ['Milk', 0])
-  await post('/set', ['milk', 1]) // same item, case-insensitive; keeps "Milk"
-  await post('/set', ['Eggs', 0])
+  assert.equal(await (await post('/lists', ['Sometime'])).text(), '2')
+  assert.equal((await post('/lists', ['sometime'])).status, 409)
+  await post('/set', [1, 'Milk', 0])
+  await post('/set', [1, 'milk', 1]) // same item, case-insensitive; keeps "Milk"
+  await post('/set', [2, 'Milk', 0]) // same name, separate list
+  assert.equal((await post('/set', [9, 'Eggs', 0])).status, 404)
+  assert.equal((await post('/set', [{}, 'Eggs', 0])).status, 404)
 
   const events = async since => {
     const ac = new AbortController(), reader = (await fetch(`${base}/events?since=${since}`, { headers, signal: ac.signal })).body.pipeThrough(new TextDecoderStream()).getReader()
@@ -41,9 +48,15 @@ try {
     ac.abort()
     return [+/id: (\d+)/.exec(buf)[1], JSON.parse(/data: (.*)/.exec(buf)[1])]
   }
-  assert.deepEqual(await events(0), [3, [[['Milk', 1], ['Eggs', 0]], true]])
-  assert.deepEqual(await events(2), [3, [[['Eggs', 0]], false]])
-  assert.deepEqual(await events(99), [3, [[['Milk', 1], ['Eggs', 0]], true]]) // stale cache -> full resync
+  const lists = [[1, 'Grocery'], [2, 'Sometime']]
+  const [rev, all] = await events(0)
+  assert.deepEqual(all, [[[1, 'Bread', 1], [1, 'Milk', 1], [2, 'Milk', 0]], true, lists])
+  assert.deepEqual((await events(rev - 1))[1], [[[2, 'Milk', 0]], false, lists])
+  assert.deepEqual((await events(rev + 1))[1], all) // stale cache -> full resync
+
+  assert.equal((await post('/lists/delete', [2])).status, 204)
+  assert.equal((await post('/lists/delete', [1])).status, 400) // last list stays
+  assert.deepEqual((await events(0))[1], [[[1, 'Bread', 1], [1, 'Milk', 1]], true, [[1, 'Grocery']]])
   assert.equal((await fetch(base + '/logout', { method: 'POST', headers, redirect: 'manual' })).status, 303)
   assert.equal((await fetch(base + '/events', { headers })).status, 401)
   console.log('ok')
