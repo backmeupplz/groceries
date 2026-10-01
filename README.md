@@ -1,6 +1,6 @@
 # groceries
 
-One shared grocery list. Tap to tick, tap a ticked item (or a suggestion) to re-add. Live sync between everyone logged in.
+Shared shopping lists (tabs on top, all shared between users). Tap to tick, tap a ticked item (or a suggestion) to re-add. Live sync between everyone logged in.
 
 Zero dependencies, Node 22.13+ (uses built-in `node:sqlite`). The whole frontend is 2.3KB gzipped.
 
