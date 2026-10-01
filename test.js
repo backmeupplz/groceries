@@ -38,5 +38,7 @@ try {
   assert.deepEqual(await events(0), [3, [[['Milk', 1], ['Eggs', 0]], true]])
   assert.deepEqual(await events(2), [3, [[['Eggs', 0]], false]])
   assert.deepEqual(await events(99), [3, [[['Milk', 1], ['Eggs', 0]], true]]) // stale cache -> full resync
+  assert.equal((await fetch(base + '/logout', { method: 'POST', headers, redirect: 'manual' })).status, 303)
+  assert.equal((await fetch(base + '/events', { headers })).status, 401)
   console.log('ok')
 } finally { srv.kill() }

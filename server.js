@@ -16,6 +16,7 @@ const addUser = q('INSERT OR IGNORE INTO users VALUES(?, ?)')
 const getUser = q('SELECT hash FROM users WHERE name = ?')
 const addSession = q('INSERT INTO sessions VALUES(?, ?)')
 const getSession = q('SELECT user FROM sessions WHERE token = ?')
+const delSession = q('DELETE FROM sessions WHERE token = ?')
 const upsert = q('INSERT INTO items VALUES(?, ?, ?) ON CONFLICT DO UPDATE SET done = excluded.done, rev = excluded.rev RETURNING name, done')
 const changes = q('SELECT name, done FROM items WHERE rev > ? ORDER BY rev')
 let rev = q('SELECT IFNULL(MAX(rev), 0) r FROM items').get().r
@@ -61,6 +62,11 @@ createServer(async (req, res) => {
   }
 
   if (!user) return end(401)
+
+  if (req.method == 'POST' && url.pathname == '/logout') {
+    delSession.run(token)
+    return end(303, { location: '/', 'set-cookie': 's=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0' })
+  }
 
   if (url.pathname == '/events') {
     let since = +(req.headers['last-event-id'] ?? url.searchParams.get('since')) || 0

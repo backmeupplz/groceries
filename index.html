@@ -14,18 +14,27 @@ input:focus { border-color: #555 }
 #auth, #app, #first, #bad { display: none }
 .login #auth, .setup #auth { display: flex } .app #app, .setup #first, .bad #bad { display: block }
 #auth { flex-direction: column; gap: .75rem; padding: 20vh 1rem 0 }
-#auth button, footer button { background: #ddd; color: #111; border-radius: 8px; padding: .7rem }
+#auth button, #nu > button { background: #ddd; color: #111; border-radius: 8px; padding: .7rem }
+h1, h2 { font-weight: 600; font-size: 1.2rem }
+nav { display: flex; align-items: center; gap: .25rem; margin-bottom: .6rem }
+nav h1 { flex: 1; padding-left: .2rem }
+nav button { display: flex; padding: .4rem; color: #888 }
+nav button:hover { color: #ddd }
+svg { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round }
+dialog { background: #1b1b1b; border: 1px solid #333; border-radius: 12px; padding: 0; width: min(22rem, calc(100% - 2rem)); margin: auto }
+dialog::backdrop { background: #000a }
+dialog input { background: #111 }
+#nu { display: grid; gap: .6rem; padding: 1rem }
 #bad { color: #e66 }
 header { position: sticky; top: 0; background: #111; padding: .75rem; z-index: 1 }
 #sug button { border: 1px solid #333; border-radius: 99px; padding: .3rem .8rem; margin: .5rem .4rem 0 0 }
 #todo button, #done button { display: block; width: 100%; text-align: left; padding: .75rem 1rem; border-bottom: 1px solid #1e1e1e; content-visibility: auto; contain-intrinsic-size: auto 2.9rem; overflow-wrap: anywhere }
 #done button { color: #555; text-decoration: line-through }
 #done:not(:empty) { border-top: 1px solid #333 }
-footer { padding: 2rem 1rem; color: #555 }
-footer form { display: grid; gap: .5rem; margin-top: .75rem }
 </style>
 <body>
 <form id="auth" method="post" action="/login">
+  <h1>Groceries</h1>
   <p id="first">Create the first user</p>
   <p id="bad">Wrong login or password</p>
   <input name="u" placeholder="login" autocomplete="username" autocapitalize="off" required>
@@ -33,13 +42,20 @@ footer form { display: grid; gap: .5rem; margin-top: .75rem }
   <button>Go</button>
 </form>
 <main id="app">
-  <header><form id="add"><input id="inp" placeholder="Add item" autocomplete="off" enterkeyhint="done"></form><div id="sug"></div></header>
+  <header>
+    <nav>
+      <h1>Groceries</h1>
+      <button id="ub" type="button" title="Users" aria-label="Users"><svg viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg></button>
+      <form method="post" action="/logout"><button title="Log out" aria-label="Log out"><svg viewBox="0 0 24 24"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/></svg></button></form>
+    </nav>
+    <form id="add"><input id="inp" placeholder="Add item" autocomplete="off" enterkeyhint="done"></form><div id="sug"></div></header>
   <div id="todo"></div><div id="done"></div>
-  <footer><details><summary>Add user</summary><form id="nu">
+  <dialog id="users"><form id="nu">
+    <h2>Add user</h2>
     <input name="u" placeholder="login" autocomplete="off" autocapitalize="off" required>
     <input name="p" type="password" placeholder="password" autocomplete="new-password" required>
     <button>Add</button>
-  </form></details></footer>
+  </form></dialog>
 </main>
 <script>
 if (document.body.classList.contains('app')) {
@@ -92,12 +108,14 @@ if (document.body.classList.contains('app')) {
   done.onclick = e => e.target != done && set(e.target.textContent, 0)
   sug.onclick = e => { if (e.target == sug) return; set(e.target.textContent, 0); inp.value = ''; suggest(); inp.focus() }
   inp.oninput = suggest
+  ub.onclick = () => users.showModal()
+  users.onclick = e => e.target == users && users.close() // backdrop click
   add.onsubmit = e => { e.preventDefault(); const v = inp.value.trim(); if (v) set(v, 0); inp.value = ''; suggest() }
   nu.onsubmit = async e => {
     e.preventDefault()
     const r = await post('/users', [nu.u.value, nu.p.value])
     alert(r.ok ? 'User added' : r.status == 409 ? 'User exists' : 'Failed')
-    if (r.ok) nu.reset()
+    if (r.ok) { nu.reset(); users.close() }
   }
   addEventListener('visibilitychange', () => document.hidden && save())
   addEventListener('pagehide', save)
