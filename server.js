@@ -68,7 +68,7 @@ const html = readFileSync(new URL('index.html', import.meta.url), 'utf8')
 const scriptHash = createHash('sha256').update(/<script>([\s\S]*?)<\/script>/.exec(html)[1]).digest('base64')
 const pageHeaders = {
   'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'referrer-policy': 'no-referrer', 'x-frame-options': 'DENY',
-  'content-security-policy': `default-src 'self'; script-src 'sha256-${scriptHash}'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'`,
+  'content-security-policy': `default-src 'self'; img-src 'self' data:; script-src 'sha256-${scriptHash}'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'`,
 }
 const clients = new Set()
 // Every event carries the full (tiny) lists array, so list adds/deletes need no extra sync.
