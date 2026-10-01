@@ -1,6 +1,7 @@
 import { createServer } from 'node:http'
 import { DatabaseSync } from 'node:sqlite'
-import { scryptSync, randomBytes, timingSafeEqual } from 'node:crypto'
+import { scrypt, randomBytes, timingSafeEqual, createHash } from 'node:crypto'
+import { promisify } from 'node:util'
 import { readFileSync } from 'node:fs'
 import { gzipSync, createGzip } from 'node:zlib'
 
@@ -8,6 +9,7 @@ const db = new DatabaseSync(process.env.DB || 'groceries.db')
 db.exec(`PRAGMA journal_mode=WAL;
 CREATE TABLE IF NOT EXISTS users(name TEXT PRIMARY KEY, hash TEXT);
 CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY, user TEXT);
+DELETE FROM sessions WHERE length(token) != 64; -- pre-hashing plaintext tokens
 CREATE TABLE IF NOT EXISTS lists(id INTEGER PRIMARY KEY, name TEXT UNIQUE COLLATE NOCASE);
 INSERT INTO lists(name) SELECT 'Grocery' WHERE NOT EXISTS (SELECT 1 FROM lists);`)
 const q = sql => db.prepare(sql)
@@ -35,11 +37,39 @@ const upsert = q('INSERT INTO items VALUES(?, ?, ?, ?) ON CONFLICT DO UPDATE SET
 const changes = q('SELECT list, name, done FROM items WHERE rev > ? ORDER BY rev')
 let rev = q('SELECT IFNULL(MAX(rev), 0) r FROM items').get().r
 
-const hash = (p, salt = randomBytes(16).toString('hex')) => salt + ':' + scryptSync(p, salt, 32).toString('hex')
-const verify = (p, h) => !!h && timingSafeEqual(Buffer.from(hash(p, h.split(':')[0])), Buffer.from(h))
+// Async scrypt runs on the threadpool, so login attempts can't freeze the event loop.
+const scryptAsync = promisify(scrypt)
+const hash = async (p, salt = randomBytes(16).toString('hex')) => salt + ':' + (await scryptAsync(p, salt, 32)).toString('hex')
+const verify = async (p, h) => timingSafeEqual(Buffer.from(await hash(p, h.split(':')[0])), Buffer.from(h))
+const DUMMY = await hash(randomBytes(16).toString('hex')) // unknown users cost the same as known ones (no enumeration)
+const sha = s => createHash('sha256').update(s).digest('hex') // sessions are stored hashed
 const str = (s, max) => typeof s == 'string' && (s = s.trim()) && s.length <= max ? s : null
+const okPassword = p => typeof p == 'string' && p.length >= 8 && p.length <= 200
+
+// The first user comes from env; there is no open "first visitor becomes admin" setup.
+if (!userCount.get().n) {
+  const u = str(process.env.ADMIN_USER, 50), p = process.env.ADMIN_PASSWORD
+  if (!u || !okPassword(p)) { console.error('No users yet: start with ADMIN_USER and ADMIN_PASSWORD (8+ chars) set'); process.exit(1) }
+  addUser.run(u, await hash(p))
+}
+
+// Failed-login backoff per username: after 5 misses, wait 1s, 2s, 4s... up to 15 min.
+// ponytail: in-memory, resets on restart; cleared wholesale if an attacker sprays >10k usernames.
+const fails = new Map
+const locked = u => { const f = fails.get(u); return f && f.n >= 5 && Date.now() < f.until }
+const fail = u => {
+  if (fails.size > 1e4) fails.clear()
+  const f = fails.get(u) || { n: 0 }
+  f.n++; f.until = Date.now() + 1000 * Math.min(2 ** Math.max(f.n - 5, 0), 900)
+  fails.set(u, f)
+}
 
 const html = readFileSync(new URL('index.html', import.meta.url), 'utf8')
+const scriptHash = createHash('sha256').update(/<script>([\s\S]*?)<\/script>/.exec(html)[1]).digest('base64')
+const pageHeaders = {
+  'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'referrer-policy': 'no-referrer', 'x-frame-options': 'DENY',
+  'content-security-policy': `default-src 'self'; script-src 'sha256-${scriptHash}'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'`,
+}
 const clients = new Set()
 // Every event carries the full (tiny) lists array, so list adds/deletes need no extra sync.
 const event = (rows, full) => `id: ${rev}\ndata: ${JSON.stringify([rows.map(r => [r.list, r.name, r.done]), full, allLists.all().map(l => [l.id, l.name])])}\n\n`
@@ -48,40 +78,60 @@ setInterval(() => clients.forEach(c => c.send(':\n\n')), 25000)
 
 const body = req => new Promise((ok, fail) => {
   let b = ''
-  req.on('data', c => (b += c).length > 1e4 && req.destroy())
+  req.setEncoding('utf8')
+  req.on('data', c => { if ((b += c).length > 1e4) { req.destroy(); fail(new Error('body too large')) } })
   req.on('end', () => ok(b)).on('error', fail)
 })
-const json = async req => { try { return JSON.parse(await body(req)) } catch { return [] } }
+// JSON API takes only application/json: a cross-origin page can't send that without a CORS preflight we never answer.
+const json = async req => {
+  if (!/^application\/json\b/.test(req.headers['content-type'])) return []
+  try { const v = JSON.parse(await body(req)); return Array.isArray(v) ? v : [] } catch { return [] }
+}
 
-createServer(async (req, res) => {
+const handle = async (req, res) => {
   const url = new URL(req.url, 'http://x')
   const gzip = /gzip/.test(req.headers['accept-encoding'])
-  const token = /(?:^|; )s=(\w+)/.exec(req.headers.cookie)?.[1]
-  const user = token && getSession.get(token)?.user
-  const end = (code, headers = {}, b) => res.writeHead(code, headers).end(b)
+  // Behind an HTTPS proxy (e.g. Cloudflare) use a Secure, host-locked cookie.
+  const secure = req.headers['x-forwarded-proto'] == 'https'
+  const cookie = secure ? '__Host-groceries' : 'groceries'
+  const token = new RegExp(`(?:^|; )${cookie}=(\\w+)`).exec(req.headers.cookie)?.[1]
+  const sid = token && sha(token)
+  const user = sid && getSession.get(sid)?.user
+  const end = (code, headers = {}, b) => res.writeHead(code, { 'x-content-type-options': 'nosniff', ...headers }).end(b)
+  const setCookie = (v, age) => `${cookie}=${v}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${age}${secure ? '; Secure' : ''}`
+
+  if (req.method == 'GET' && url.pathname == '/health') return end(200, {}, 'ok')
+
+  // CSRF: other apps on the same host (other ports) or sibling subdomains are "same-site", so SameSite=Lax isn't enough.
+  // Browsers always send Sec-Fetch-Site (or at least Origin) on POST; non-browser clients send neither and aren't CSRF vectors.
+  if (req.method == 'POST') {
+    const site = req.headers['sec-fetch-site'], origin = req.headers.origin
+    if (site ? site != 'same-origin' : origin && origin != 'null' && new URL(origin).host != req.headers.host) return end(403)
+  }
 
   if (req.method == 'GET' && url.pathname == '/') {
-    const cls = !userCount.get().n ? 'setup' : !user ? 'login' : 'app'
-    const page = html.replace('<body>', `<body class="${cls}${url.search == '?bad' ? ' bad' : ''}">`)
-    return end(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', ...gzip && { 'content-encoding': 'gzip' } }, gzip ? gzipSync(page) : page)
+    const page = html.replace('<body>', `<body class="${user ? 'app' : 'login'}${url.search == '?bad' ? ' bad' : ''}">`)
+    return end(200, { ...pageHeaders, ...gzip && { 'content-encoding': 'gzip' } }, gzip ? gzipSync(page) : page)
   }
 
   if (req.method == 'POST' && url.pathname == '/login') {
     const f = new URLSearchParams(await body(req))
-    const u = str(f.get('u'), 50), p = f.get('p')
-    // First visitor on an empty DB creates the first user.
-    if (u && p && !userCount.get().n) addUser.run(u, hash(p))
-    if (!u || !p || !verify(p, getUser.get(u)?.hash)) return end(303, { location: '/?bad' })
+    const u = str(f.get('u'), 50), p = f.get('p') || ''
+    if (!u || locked(u)) return end(303, { location: '/?bad' })
+    const h = getUser.get(u)?.hash
+    if (!(await verify(p, h || DUMMY)) || !h) { fail(u); return end(303, { location: '/?bad' }) }
+    fails.delete(u)
     const t = randomBytes(24).toString('hex')
-    addSession.run(t, u)
-    return end(303, { location: '/', 'set-cookie': `s=${t}; HttpOnly; SameSite=Lax; Path=/; Max-Age=31536000` })
+    addSession.run(sha(t), u)
+    return end(303, { location: '/', 'set-cookie': setCookie(t, 31536000) })
   }
 
   if (!user) return end(401)
 
   if (req.method == 'POST' && url.pathname == '/logout') {
-    delSession.run(token)
-    return end(303, { location: '/', 'set-cookie': 's=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0' })
+    delSession.run(sid)
+    clients.forEach(c => c.sid == sid && c.end())
+    return end(303, { location: '/', 'set-cookie': setCookie('', 0) })
   }
 
   if (url.pathname == '/events') {
@@ -92,7 +142,7 @@ createServer(async (req, res) => {
     if (gzip) out.pipe(res)
     const send = s => { out.write(s); gzip && out.flush() }
     send('retry: 2000\n' + event(changes.all(since), !since))
-    const c = { user, send, end: () => res.end() }
+    const c = { user, sid, send, end: () => res.end() }
     clients.add(c)
     return req.on('close', () => clients.delete(c))
   }
@@ -127,7 +177,7 @@ createServer(async (req, res) => {
   }
 
   if (req.method == 'GET' && url.pathname == '/users')
-    return end(200, { 'content-type': 'application/json' }, JSON.stringify([user, listUsers.all().map(r => r.name)]))
+    return end(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }, JSON.stringify([user, listUsers.all().map(r => r.name)]))
 
   if (req.method == 'POST' && url.pathname == '/users/delete') {
     const [name] = await json(req)
@@ -141,9 +191,15 @@ createServer(async (req, res) => {
   if (req.method == 'POST' && url.pathname == '/users') {
     const [n, p] = await json(req)
     const name = str(n, 50)
-    if (!name || typeof p != 'string' || !p) return end(400)
-    return end(addUser.run(name, hash(p)).changes ? 204 : 409)
+    if (!name || !okPassword(p)) return end(400)
+    return end(addUser.run(name, await hash(p)).changes ? 204 : 409)
   }
 
   end(404)
-}).listen(process.env.PORT || 3000, () => console.log(`http://localhost:${process.env.PORT || 3000}`))
+}
+
+// One bad request (malformed URL, aborted upload, ...) must never take the process down.
+createServer((req, res) => handle(req, res).catch(e => {
+  console.error(e.message)
+  res.headersSent ? res.destroy() : res.writeHead(400).end()
+})).listen(process.env.PORT || 3000, () => console.log(`http://localhost:${process.env.PORT || 3000}`))

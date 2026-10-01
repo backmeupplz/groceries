@@ -13,8 +13,8 @@ button { background: none; border: 0; cursor: pointer; touch-action: manipulatio
 .off { content-visibility: hidden; height: 0; border: 0 !important } /* inactive list: keeps its layout, so switching back is instant */
 input { width: 100%; background: #1b1b1b; border: 1px solid #333; border-radius: 8px; padding: .7rem .9rem; outline: 0 }
 input:focus { border-color: #555 }
-#auth, #app, #first, #bad { display: none }
-.login #auth, .setup #auth { display: flex } .app #app, .setup #first, .bad #bad { display: block }
+#auth, #app, #bad { display: none }
+.login #auth { display: flex } .app #app, .bad #bad { display: block }
 #auth { flex-direction: column; gap: .75rem; padding: 20vh 1rem 0 }
 #auth button, #nu > button { background: #ddd; color: #111; border-radius: 8px; padding: .7rem }
 h1, h2 { font-weight: 600; font-size: 1.2rem }
@@ -46,7 +46,6 @@ header { position: sticky; top: 0; background: #111; padding: .75rem; z-index: 1
 <body>
 <form id="auth" method="post" action="/login">
   <h1>Groceries</h1>
-  <p id="first">Create the first user</p>
   <p id="bad">Wrong login or password</p>
   <input name="u" placeholder="login" autocomplete="username" autocapitalize="off" required>
   <input name="p" type="password" placeholder="password" autocomplete="current-password" required>
@@ -58,7 +57,7 @@ header { position: sticky; top: 0; background: #111; padding: .75rem; z-index: 1
       <h1>Groceries</h1>
       <button id="lb" type="button" title="Delete this list" aria-label="Delete this list"><svg viewBox="0 0 24 24"><path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg></button>
       <button id="ub" type="button" title="Users" aria-label="Users"><svg viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg></button>
-      <form method="post" action="/logout"><button title="Log out" aria-label="Log out"><svg viewBox="0 0 24 24"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/></svg></button></form>
+      <form id="lo" method="post" action="/logout"><button title="Log out" aria-label="Log out"><svg viewBox="0 0 24 24"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/></svg></button></form>
     </nav>
     <div id="tabs"><button id="nl" type="button" title="New list" aria-label="New list">+</button></div>
     <form id="add"><input id="inp" placeholder="Add item" autocomplete="off" enterkeyhint="done"></form><div id="sug"></div></header>
@@ -68,7 +67,7 @@ header { position: sticky; top: 0; background: #111; padding: .75rem; z-index: 1
     <ul id="ul"></ul>
     <form id="nu">
       <input name="u" placeholder="login" autocomplete="off" autocapitalize="off" required>
-      <input name="p" type="password" placeholder="password" autocomplete="new-password" required>
+      <input name="p" type="password" placeholder="password (8+ chars)" autocomplete="new-password" minlength="8" required>
       <button>Add user</button>
     </form>
   </div></dialog>
@@ -114,7 +113,7 @@ if (document.body.classList.contains('app')) {
 
   const post = async (path, body) => {
     for (;;) {
-      try { const r = await fetch(path, { method: 'POST', body: JSON.stringify(body) }); if (r.status == 401) location.reload(); return r } catch {}
+      try { const r = await fetch(path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }); if (r.status == 401) location.reload(); return r } catch {}
       await new Promise(r => setTimeout(r, 2000)) // offline / flaky network: retry until it lands
     }
   }
@@ -159,6 +158,7 @@ if (document.body.classList.contains('app')) {
     cur = +await r.text() // switches once the list arrives over the stream
     if (lists.has(cur)) show(cur)
   }
+  lo.onsubmit = () => { try { localStorage.clear() } catch {} } // don't leave lists on a shared device
   lb.onclick = () => { if (confirm(`Delete list "${lists.get(cur).tab.textContent}" and all its items?`)) post('/lists/delete', [cur]) }
   const loadUsers = async () => {
     const [me, names] = await (await fetch('/users')).json()
@@ -185,5 +185,5 @@ if (document.body.classList.contains('app')) {
   }
   addEventListener('visibilitychange', () => document.hidden && save())
   addEventListener('pagehide', save)
-}
+} else try { localStorage.clear() } catch {}
 </script>

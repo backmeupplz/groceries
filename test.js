@@ -3,11 +3,12 @@ import { spawn } from 'node:child_process'
 import assert from 'node:assert'
 import { tmpdir } from 'node:os'
 import { DatabaseSync } from 'node:sqlite'
+import { connect } from 'node:net'
 
 const PORT = 3999, base = `http://localhost:${PORT}`, DB = `${tmpdir()}/groceries-test-${Date.now()}.db`
 // start from a v1 (single list) DB to exercise the migration
 new DatabaseSync(DB).exec(`CREATE TABLE items(name TEXT PRIMARY KEY COLLATE NOCASE, done INT, rev INT); CREATE INDEX items_rev ON items(rev); INSERT INTO items VALUES('Bread', 1, 1)`)
-const srv = spawn('node', ['server.js'], { env: { ...process.env, PORT, DB }, stdio: 'inherit' })
+const srv = spawn('node', ['server.js'], { env: { ...process.env, PORT, DB, ADMIN_USER: 'me', ADMIN_PASSWORD: 'password1' }, stdio: 'inherit' })
 await new Promise(r => setTimeout(r, 500))
 
 const login = async (u, p) => {
@@ -15,23 +16,47 @@ const login = async (u, p) => {
   return [r.headers.get('location'), r.headers.get('set-cookie')?.split(';')[0]]
 }
 try {
-  assert.match(await (await fetch(base)).text(), /class="setup"/)
-  const [, cookie] = await login('me', 'pw')
-  assert.ok(cookie)
+  const page = await fetch(base)
+  assert.match(await page.text(), /class="login"/)
+  assert.match(page.headers.get('content-security-policy'), /script-src 'sha256-/)
+  assert.equal(page.headers.get('x-frame-options'), 'DENY')
+  assert.equal(await (await fetch(base + '/health')).text(), 'ok')
+  const [, cookie] = await login('me', 'password1') // seeded from env
+  assert.match(cookie, /^groceries=\w+$/)
   assert.equal((await login('me', 'nope'))[0], '/?bad')
   assert.equal((await fetch(base + '/events')).status, 401)
-  const headers = { cookie }
-  const post = (path, body) => fetch(base + path, { method: 'POST', headers, body: JSON.stringify(body) })
+  const headers = { cookie, 'content-type': 'application/json' }
+  const post = (path, body, extra) => fetch(base + path, { method: 'POST', headers: { ...headers, ...extra }, body: JSON.stringify(body) })
 
-  assert.equal((await post('/users', ['wife', 'pw2'])).status, 204)
-  assert.equal((await post('/users', ['wife', 'x'])).status, 409)
-  const [, wifeCookie] = await login('wife', 'pw2')
+  // CSRF: same-site sibling app (other port) can't post, even text/plain bodies that happen to be valid JSON
+  assert.equal((await post('/users', ['evil', 'password1'], { 'sec-fetch-site': 'same-site' })).status, 403)
+  assert.equal((await post('/users', ['evil', 'password1'], { origin: 'http://localhost:1234' })).status, 403)
+  assert.equal((await post('/users', ['evil', 'password1'], { 'content-type': 'text/plain' })).status, 400)
+  assert.equal((await post('/users', ['evil', 'password1'], { 'sec-fetch-site': 'same-origin', origin: base })).status, 204)
+
+  // crash attempts: server must survive all of these
+  for (const b of [null, 5, {}, '"x"']) assert.equal((await post('/set', b)).status, 400)
+  await new Promise(ok => { const s = connect(PORT, 'localhost', () => s.end('GET //[ HTTP/1.1\r\nHost: x\r\n\r\n')); s.on('data', () => {}).on('close', ok) })
+  await new Promise(ok => { const s = connect(PORT, 'localhost', () => { s.write('POST /login HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\nabc'); setTimeout(() => s.destroy(), 100) }); s.on('close', ok) })
+  await new Promise(r => setTimeout(r, 200))
+  assert.equal((await fetch(base + '/health')).status, 200)
+
+  assert.equal((await post('/users', ['wife', 'short'])).status, 400) // < 8 chars
+  assert.equal((await post('/users', ['wife', 'password2'])).status, 204)
+  assert.equal((await post('/users', ['wife', 'password3'])).status, 409)
+  const [, wifeCookie] = await login('wife', 'password2')
   assert.ok(wifeCookie)
-  assert.deepEqual(await (await fetch(base + '/users', { headers })).json(), ['me', ['me', 'wife']])
+  assert.deepEqual(await (await fetch(base + '/users', { headers })).json(), ['me', ['evil', 'me', 'wife']])
   assert.equal((await post('/users/delete', ['me'])).status, 400)
   assert.equal((await post('/users/delete', ['wife'])).status, 204)
   assert.equal((await fetch(base + '/events', { headers: { cookie: wifeCookie } })).status, 401)
-  assert.equal((await login('wife', 'pw2'))[0], '/?bad')
+  assert.equal((await login('wife', 'password2'))[0], '/?bad')
+
+  // brute force: after 5 misses even the right password is refused for a while
+  for (let i = 0; i < 5; i++) await login('evil', 'wrong')
+  assert.equal((await login('evil', 'password1'))[0], '/?bad')
+  // sessions are stored hashed
+  assert.ok(new DatabaseSync(DB).prepare('SELECT token FROM sessions').all().every(r => r.token.length == 64 && !cookie.includes(r.token)))
 
   assert.equal(await (await post('/lists', ['Sometime'])).text(), '2')
   assert.equal((await post('/lists', ['sometime'])).status, 409)
