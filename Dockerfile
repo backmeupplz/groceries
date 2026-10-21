@@ -1,4 +1,4 @@
-FROM node:24-alpine
+FROM node:24.22.1-alpine
 WORKDIR /app
 COPY server.js index.html ./
 RUN mkdir /data && chown node:node /data
