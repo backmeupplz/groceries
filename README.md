@@ -17,6 +17,8 @@ node test.js                                                    # tests
 docker run -d -p 3000:3000 -v groceries:/data -e ADMIN_USER=me -e ADMIN_PASSWORD=change-me-please ghcr.io/backmeupplz/groceries
 ```
 
+Images for amd64 and arm64 are published to GitHub Container Registry by Forgejo Actions on every release published on [git.borodutch.com](https://git.borodutch.com/backmeupplz/groceries) (`tea release create --repo backmeupplz/groceries --tag vX.Y.Z --title vX.Y.Z`).
+
 Also available as an app on [MyGround](https://myground.online).
 
 ## Security notes
