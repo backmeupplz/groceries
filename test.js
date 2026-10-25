@@ -9,7 +9,10 @@ const PORT = 3999, base = `http://localhost:${PORT}`, DB = `${tmpdir()}/grocerie
 // start from a v1 (single list) DB to exercise the migration
 new DatabaseSync(DB).exec(`CREATE TABLE items(name TEXT PRIMARY KEY COLLATE NOCASE, done INT, rev INT); CREATE INDEX items_rev ON items(rev); INSERT INTO items VALUES('Bread', 1, 1), ('Eggs x2', 0, 2), ('Jam 3x', 1, 3)`)
 const srv = spawn('node', ['server.js'], { env: { ...process.env, PORT, DB, ADMIN_USER: 'me', ADMIN_PASSWORD: 'password1' }, stdio: 'inherit' })
-await new Promise(r => setTimeout(r, 500))
+// wait for the server to listen (a fixed 500 ms was too short on a busy CI runner)
+for (let i = 0; ; i++) {
+  try { await fetch(base + '/health'); break } catch (e) { if (i === 100) throw e; await new Promise(r => setTimeout(r, 100)) }
+}
 
 const login = async (u, p) => {
   const r = await fetch(base + '/login', { method: 'POST', body: new URLSearchParams({ u, p }), redirect: 'manual' })
