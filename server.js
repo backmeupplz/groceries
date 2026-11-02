@@ -78,12 +78,14 @@ if (!userCount.get().n) {
 
 // Failed-login backoff per username: after 5 misses, wait 1s, 2s, 4s... up to 15 min.
 // ponytail: in-memory, resets on restart; cleared wholesale if an attacker sprays >10k usernames.
+// LOGIN_BACKOFF_MS (default 1 s) scales the steps; the test sets it long so the lockout can't lapse mid-check.
+const BACKOFF_MS = +process.env.LOGIN_BACKOFF_MS || 1000
 const fails = new Map
 const locked = u => { const f = fails.get(u); return f && f.n >= 5 && Date.now() < f.until }
 const fail = u => {
   if (fails.size > 1e4) fails.clear()
   const f = fails.get(u) || { n: 0 }
-  f.n++; f.until = Date.now() + 1000 * Math.min(2 ** Math.max(f.n - 5, 0), 900)
+  f.n++; f.until = Date.now() + BACKOFF_MS * Math.min(2 ** Math.max(f.n - 5, 0), 900)
   fails.set(u, f)
 }
 

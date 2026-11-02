@@ -8,11 +8,9 @@ import { connect } from 'node:net'
 const PORT = 3999, base = `http://localhost:${PORT}`, DB = `${tmpdir()}/groceries-test-${Date.now()}.db`
 // start from a v1 (single list) DB to exercise the migration
 new DatabaseSync(DB).exec(`CREATE TABLE items(name TEXT PRIMARY KEY COLLATE NOCASE, done INT, rev INT); CREATE INDEX items_rev ON items(rev); INSERT INTO items VALUES('Bread', 1, 1), ('Eggs x2', 0, 2), ('Jam 3x', 1, 3)`)
-const srv = spawn('node', ['server.js'], { env: { ...process.env, PORT, DB, ADMIN_USER: 'me', ADMIN_PASSWORD: 'password1' }, stdio: 'inherit' })
-// wait for the server to listen (a fixed 500 ms was too short on a busy CI runner)
-for (let i = 0; ; i++) {
-  try { await fetch(base + '/health'); break } catch (e) { if (i === 100) throw e; await new Promise(r => setTimeout(r, 100)) }
-}
+const srv = spawn('node', ['server.js'], { env: { ...process.env, PORT, DB, ADMIN_USER: 'me', ADMIN_PASSWORD: 'password1', LOGIN_BACKOFF_MS: 3600000 }, stdio: ['ignore', 'pipe', 'inherit'] })
+// the server prints its URL once it listens
+await new Promise((ok, fail) => { srv.stdout.on('data', d => /http:\/\//.test(d) && ok()); srv.on('exit', fail) })
 
 const login = async (u, p) => {
   const r = await fetch(base + '/login', { method: 'POST', body: new URLSearchParams({ u, p }), redirect: 'manual' })
@@ -40,8 +38,8 @@ try {
   // crash attempts: server must survive all of these
   for (const b of [null, 5, {}, '"x"']) assert.equal((await post('/set', b)).status, 400)
   await new Promise(ok => { const s = connect(PORT, 'localhost', () => s.end('GET //[ HTTP/1.1\r\nHost: x\r\n\r\n')); s.on('data', () => {}).on('close', ok) })
-  await new Promise(ok => { const s = connect(PORT, 'localhost', () => { s.write('POST /login HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\nabc'); setTimeout(() => s.destroy(), 100) }); s.on('close', ok) })
-  await new Promise(r => setTimeout(r, 200))
+  // upload cut off mid-body: the server's "100 Continue" says the handler is reading the body, then the client hangs up
+  await new Promise(ok => { const s = connect(PORT, 'localhost', () => s.write('POST /login HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 100\r\n\r\n')); s.once('data', () => s.end('abc')).on('close', ok) })
   assert.equal((await fetch(base + '/health')).status, 200)
 
   assert.equal((await post('/users', ['wife', 'short'])).status, 400) // < 8 chars
